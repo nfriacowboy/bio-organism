@@ -161,6 +161,22 @@ class OrganismoSNN(nn.Module):
             len(self._spike_rates_h1) + len(self._spike_rates_h2)
         )
 
+    # -------------------------------------------------------------------
+    def replay_update(self, spike_patterns: dict, recompensa: float) -> None:
+        """
+        Replay: reforça padrões de spikes guardados no ExperienceReplay.
+
+        Chamado por ExperienceReplay.consolidar() durante a fase de "sono"
+        (entre episódios). A implementação efectiva do update de pesos é
+        feita pelo RSTDPLearner via o ciclo de consolidação — este método
+        serve como ponto de extensão para actualizações futuras directamente
+        na rede (ex: Hebbian offline sobre os padrões arquivados).
+
+        spike_patterns: dict com chaves 'h1', 'h2', 'out' (tensores de spikes).
+        recompensa:     sinal de recompensa associado à experiência.
+        """
+        pass   # stub — full weight update delegated to RSTDPLearner.consolidar_replay()
+
 
 # ---------------------------------------------------------------------------
 # ANN-to-SNN conversion helper (spec §2.2 NOTA IMP.)
