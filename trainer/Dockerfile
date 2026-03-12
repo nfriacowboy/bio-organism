@@ -10,4 +10,7 @@ RUN uv sync --no-cache
 
 COPY src/ ./src/
 
-CMD ["python", "-m", "src.training.trainer"]
+# Adicionar src/ ao PYTHONPATH para imports absolutos (ex: from world.vision import ...)
+ENV PYTHONPATH=/app/src
+
+CMD ["python", "-m", "training.trainer"]
