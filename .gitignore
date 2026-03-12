@@ -1,0 +1,28 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+*.egg
+
+# Node
+node_modules/
+web/dist/
+web/build/
+
+# MLflow / artefactos
+mlruns/
+mlartifacts/
+
+# PyTorch / modelos
+*.pt
+*.pth
+
+# Misc
+.DS_Store
+*.log
