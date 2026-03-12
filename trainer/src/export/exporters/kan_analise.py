@@ -34,16 +34,31 @@ def exportar(cfg: ExportConfig) -> list[Path]:
         meta = get_treino_metadata(cfg.treino_id, conn)
         df_hist = get_kan_outputs_historico(cfg.treino_id, conn)
 
-    run_id = meta.get("mlflow_run_id") or mf.get_run_id(cfg.treino_id)
-    kan_path: Path | None = None
-    if run_id:
-        tmp = out_dir / "_modelos"
-        for name in ("kan_final.pt", "kan_ep500.pt", "kan_ep400.pt",
-                     "kan_ep300.pt", "kan_ep200.pt", "kan_ep100.pt"):
-            p = mf.download_artifact(run_id, name, tmp)
-            if p and p.exists():
-                kan_path = p
-                break
+    import os, signal
+    artifact_root = Path(os.getenv("MLFLOW_ARTIFACT_ROOT", "./mlartifacts"))
+    local_dir = artifact_root / cfg.treino_id
+
+    def _local_or_mlflow(names: list[str]) -> Path | None:
+        for name in names:
+            p = local_dir / name
+            if p.exists():
+                return p
+        run_id_val = meta.get("mlflow_run_id") or mf.get_run_id(cfg.treino_id)
+        if run_id_val:
+            tmp = out_dir / "_modelos"
+            for name in names:
+                try:
+                    def _timeout(signum, frame): raise TimeoutError()
+                    signal.signal(signal.SIGALRM, _timeout)
+                    signal.alarm(10)
+                    p = mf.download_artifact(run_id_val, name, tmp)
+                    signal.alarm(0)
+                    if p and p.exists(): return p
+                except Exception: signal.alarm(0)
+        return None
+
+    kan_path = _local_or_mlflow(["kan_ep50.pt", "kan_ep25.pt", "kan_final.pt",
+                                  "kan_ep100.pt", "kan_ep200.pt"])
 
     # -----------------------------------------------------------------------
     # 1. kan_outputs_historico.csv

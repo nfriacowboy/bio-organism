@@ -128,7 +128,7 @@ class MLflowTracker:
         snn_state_dict: dict,
         kan_state_dict: dict | None = None,
         episodio: int | None = None,
-        path_prefix: str = "/mlartifacts",
+        path_prefix: str | None = None,
     ) -> dict[str, str]:
         """
         Save SNN (and optionally KAN) model weights to disk with SHA256 checksums.
@@ -146,6 +146,9 @@ class MLflowTracker:
             Dict with ``path_snn``, ``checksum_snn`` and (if KAN provided)
             ``path_kan``, ``checksum_kan``.
         """
+        import os
+        if path_prefix is None:
+            path_prefix = os.getenv("MLFLOW_ARTIFACT_ROOT", "./mlartifacts")
         output_dir = Path(path_prefix) / self._treino_id
         output_dir.mkdir(parents=True, exist_ok=True)
 

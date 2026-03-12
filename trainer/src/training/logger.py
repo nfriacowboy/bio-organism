@@ -205,7 +205,7 @@ class TreinoManager:
                     text(
                         """
                         INSERT INTO treinos (id, data_human, nota, estado, parametros)
-                        VALUES (:id, :data_human, :nota, 'a_correr', :parametros::jsonb)
+                        VALUES (:id, :data_human, :nota, 'a_correr', CAST(:parametros AS JSONB))
                         """
                     ),
                     {
@@ -229,7 +229,7 @@ class TreinoManager:
                     text(
                         """
                         UPDATE treinos
-                        SET metricas_finais = :metricas::jsonb
+                        SET metricas_finais = CAST(:metricas AS JSONB)
                         WHERE id = :id
                         """
                     ),

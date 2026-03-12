@@ -192,7 +192,10 @@ def exportar(cfg: ExportConfig) -> list[Path]:
                     "eficiencia_na_mudanca":       round(float(row["eficiencia"]), 4),
                 })
             prev_fase = fase
-        pd.DataFrame(rows).to_csv(fase_path, index=False)
+        pd.DataFrame(rows, columns=[
+            "episodio_mudanca", "fase_anterior", "fase_nova",
+            "tempo_vida_medio_na_mudanca", "eficiencia_na_mudanca",
+        ]).to_csv(fase_path, index=False)
 
     generated.append(fase_path)
     print(f"  [metricas] {fase_path.name}")

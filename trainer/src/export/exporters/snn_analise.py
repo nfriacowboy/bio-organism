@@ -96,26 +96,44 @@ def exportar(cfg: ExportConfig) -> list[Path]:
     generated: list[Path] = []
     out_dir = cfg.cat("snn")
 
-    # Tentar carregar modelos do MLflow
+    # Tentar carregar modelos — primeiro local, depois MLflow
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     with cfg.engine.connect() as conn:
         meta = get_treino_metadata(cfg.treino_id, conn)
 
-    run_id = meta.get("mlflow_run_id") or mf.get_run_id(cfg.treino_id)
-    model_inicial_path: Path | None = None
-    model_final_path: Path | None = None
+    import os
+    artifact_root = Path(os.getenv("MLFLOW_ARTIFACT_ROOT", "./mlartifacts"))
+    local_dir = artifact_root / cfg.treino_id
 
-    if run_id:
-        tmp = out_dir / "_modelos"
-        model_inicial_path = mf.download_artifact(run_id, "snn_ep0.pt", tmp)
-        if model_inicial_path is None:
-            model_inicial_path = mf.download_artifact(run_id, "snn_ep50.pt", tmp)
-        # Tentar encontrar modelo final
-        for ep_try in [500, 400, 300, 200, 100, 50]:
-            p = mf.download_artifact(run_id, f"snn_ep{ep_try}.pt", tmp)
-            if p and p.exists():
-                model_final_path = p
-                break
+    def _local_or_mlflow(names: list[str]) -> Path | None:
+        # 1. Procurar ficheiro local
+        for name in names:
+            p = local_dir / name
+            if p.exists():
+                return p
+        # 2. Tentar download MLflow (com timeout curto)
+        run_id_val = meta.get("mlflow_run_id") or mf.get_run_id(cfg.treino_id)
+        if run_id_val:
+            tmp = out_dir / "_modelos"
+            for name in names:
+                try:
+                    import signal
+                    def _timeout(signum, frame):
+                        raise TimeoutError("MLflow download timeout")
+                    signal.signal(signal.SIGALRM, _timeout)
+                    signal.alarm(10)
+                    p = mf.download_artifact(run_id_val, name, tmp)
+                    signal.alarm(0)
+                    if p and p.exists():
+                        return p
+                except (TimeoutError, Exception):
+                    signal.alarm(0)
+        return None
+
+    model_inicial_path = _local_or_mlflow(["snn_ep0.pt", "snn_ep25.pt", "snn_ep50.pt"])
+    model_final_path   = _local_or_mlflow(["snn_ep500.pt", "snn_ep400.pt", "snn_ep300.pt",
+                                            "snn_ep200.pt", "snn_ep100.pt", "snn_ep50.pt",
+                                            "snn_ep25.pt"])
 
     # -----------------------------------------------------------------------
     # 1. spike_rates_por_camada.csv
