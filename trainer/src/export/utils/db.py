@@ -280,3 +280,24 @@ def get_posicoes_todas(
     n_ep = conn.execute(n_ep_sql, {"tid": treino_id}).scalar() or 1
     df["visitas_media_por_episodio"] = df["visitas_total"] / n_ep
     return df
+
+
+# ---------------------------------------------------------------------------
+# Episódios log (single source of truth para métricas por episódio)
+# ---------------------------------------------------------------------------
+
+def get_episodios_log(treino_id: str, conn: Connection) -> pd.DataFrame:
+    """Lê episodios_log — fonte primária para métricas por episódio."""
+    sql = text("""
+        SELECT
+            episodio, tempo_vida, comida, eficiencia, recompensa_total,
+            taxa_inferencia, novidade_media,
+            bias_explorar_medio, bias_exploitar_medio,
+            fase_curriculum, morreu,
+            precisao_direcional, steps_com_visao, taxa_perseguicao,
+            seed, p_avancar
+        FROM episodios_log
+        WHERE treino_id = :tid
+        ORDER BY episodio
+    """)
+    return pd.read_sql(sql, conn, params={"tid": treino_id})

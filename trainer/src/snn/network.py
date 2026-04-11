@@ -1,13 +1,13 @@
 """
 Arquitectura SNN do Organismo.
 
-Topologia:
-  Input  18  (15 visão + 3 estado: energia_norm, tempo_vida_norm, bias=1.0)
+Topologia v4.0 (loop sensoriomotor + olfacto + feromonas):
+  Input  45  (15 visão + 3 estado + 4 eferente + 15 flow + 2 prop + 3 olfato + 3 feromona)
   H1     64  LIF feedforward
   H2     32  RLIF recorrente (ligações laterais)
   Output  4  LIF winner-take-all → avancar | virar_esquerda | virar_direita | parar
 
-Params base: tau=20ms, threshold=1.0, soft-reset, FastSigmoid(slope=25), T=8
+Params base: tau=5ms, threshold=0.01 (v20), soft-reset, FastSigmoid(slope=25), T=8
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import torch.nn as nn
 from spikingjelly.activation_based import neuron, surrogate, functional, layer
 
 # Dimensões fixas da rede
-N_INPUT   = 18   # 15 visão + 3 estado
+N_INPUT   = 45   # v4.0: 15 visual + 3 estado + 4 eferente + 15 flow + 2 prop + 3 olfato + 3 feromona
 N_H1      = 64
 N_H2      = 32
 N_OUTPUT  = 4
@@ -43,7 +43,7 @@ class OrganismoSNN(nn.Module):
     def __init__(
         self,
         tau: float = 5.0,          # tau=5 com T=8: membrana carrega em ~6 steps
-        threshold: float = 0.3,    # limiar ajustado para inputs rate-coded
+        threshold: float = 0.01,   # v20: 0.01 — pesos ANN init geram potencial ~0.01-0.03/step; 0.15 causava 100% neurónios mortos
         t_steps: int = T_STEPS,
         device: torch.device | None = None,
     ):
@@ -76,19 +76,27 @@ class OrganismoSNN(nn.Module):
     # -------------------------------------------------------------------
     def _init_weights(self) -> None:
         # Pesos positivos com escala suficiente para gerar spikes logo no início.
-        # Com threshold=0.3 e ~3 inputs activos por timestep precisamos:
-        # 3 * avg_weight > 0.3  →  avg_weight > 0.1  →  [0.05, 0.25]
+        # Com threshold=0.01 e inputs normalizados [0,1], potencial médio >> 0.01 → spikes garantidos.
         nn.init.uniform_(self.fc1.weight, 0.05, 0.25)
         nn.init.constant_(self.fc1.bias, 0.05)
 
         nn.init.uniform_(self.fc2.weight, 0.03, 0.18)
         nn.init.constant_(self.fc2.bias, 0.02)
 
-        nn.init.uniform_(self.fc3.weight, -0.15, 0.15)
+        # Output: pesos positivos iniciais para garantir que os neurónios de output
+        # disparam desde o início, permitindo que R-STDP aprenda diferenças entre acções.
+        nn.init.uniform_(self.fc3.weight, 0.02, 0.10)
         nn.init.zeros_(self.fc3.bias)
 
         # Recorrência inicializada pequena para estabilidade
         nn.init.uniform_(self.fc2_rec.weight, -0.05, 0.05)
+
+    # -------------------------------------------------------------------
+    def set_threshold(self, threshold: float) -> None:
+        """Actualiza v_threshold em todas as camadas LIF (lif1, lif2, lif3)."""
+        self.lif1.v_threshold = threshold
+        self.lif2.v_threshold = threshold
+        self.lif3.v_threshold = threshold
 
     # -------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -209,6 +217,117 @@ def converter_ann_para_snn(snn: OrganismoSNN, ann: _ANNEquivalente) -> None:
         snn.fc2.bias.copy_(ann.net[2].bias)
         snn.fc3.weight.copy_(ann.net[4].weight)
         snn.fc3.bias.copy_(ann.net[4].bias)
+
+
+# ---------------------------------------------------------------------------
+# Batched forward para N organismos com pesos diferentes (GPU efficiency)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def batched_forward_multi_snn(
+    all_snns: list["OrganismoSNN"],
+    x_batch: torch.Tensor,    # [N, T, N_INPUT]
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Forward pass batched para N organismos com pesos divergentes (evolução).
+
+    Em vez de chamar snn.forward() N vezes sequencialmente (batch=1 cada),
+    faz UMA passagem GPU com todos os N organismos em simultâneo usando
+    bmm (batch matrix multiply) com os pesos empilhados [N, out, in].
+
+    Com N=50 e GPU: ~5ms totais vs ~250ms sequencial → ~50× speedup.
+
+    Parâmetros:
+        all_snns : lista de N OrganismoSNN (cada um com pesos próprios)
+        x_batch  : [N, T, N_INPUT] — inputs codificados por organismo
+        device   : torch.device (cuda para speedup real)
+
+    Retorna:
+        spike_counts : [N, N_OUTPUT]    — contagem de spikes (para winner-take-all)
+        h1_spikes    : [T, N, N_H1]    — activações H1 para R-STDP
+        h2_spikes    : [T, N, N_H2]    — activações H2 para R-STDP
+        out_spikes   : [T, N, N_OUTPUT] — activações output para R-STDP
+    """
+    N = len(all_snns)
+    T = x_batch.shape[1]
+
+    # Stack pesos de todos os organismos: [N, out_dim, in_dim]
+    fc1_w  = torch.stack([s.fc1.weight      for s in all_snns]).to(device)  # [N,64,45]
+    fc1_b  = torch.stack([s.fc1.bias        for s in all_snns]).to(device)  # [N,64]
+    fc2_w  = torch.stack([s.fc2.weight      for s in all_snns]).to(device)  # [N,32,64]
+    fc2_b  = torch.stack([s.fc2.bias        for s in all_snns]).to(device)  # [N,32]
+    fc2r_w = torch.stack([s.fc2_rec.weight  for s in all_snns]).to(device)  # [N,32,32]
+    fc3_w  = torch.stack([s.fc3.weight      for s in all_snns]).to(device)  # [N,4,32]
+    fc3_b  = torch.stack([s.fc3.bias        for s in all_snns]).to(device)  # [N,4]
+
+    # Biases KAN por organismo (injectados no output pelo trainer)
+    bias_expl = torch.tensor([s.bias_explorar  for s in all_snns], device=device)  # [N]
+    bias_expt = torch.tensor([s.bias_exploitar for s in all_snns], device=device)  # [N]
+
+    # Parâmetros LIF (tau/threshold iguais em todos os organismos por design)
+    tau       = float(all_snns[0].lif1.tau)
+    threshold = float(all_snns[0].lif1.v_threshold)
+    decay     = 1.0 - 1.0 / tau   # SpikingJelly: H = v*(1-1/tau) + X*(1/tau)
+    inp_scale = 1.0 / tau
+
+    # Estados LIF inicializados a zero [N, H] — equivalente a functional.reset_net()
+    v1    = torch.zeros(N, N_H1,     device=device)
+    v2    = torch.zeros(N, N_H2,     device=device)
+    v3    = torch.zeros(N, N_OUTPUT, device=device)
+    h2_sp = torch.zeros(N, N_H2,    device=device)  # spikes recorrentes H2(t-1)
+
+    spike_out_accum = torch.zeros(N, N_OUTPUT, device=device)
+    h1_list:  list[torch.Tensor] = []
+    h2_list:  list[torch.Tensor] = []
+    out_list: list[torch.Tensor] = []
+
+    xb = x_batch.to(device)  # [N, T, 45]
+
+    for t in range(T):
+        xt = xb[:, t, :]   # [N, 45]
+
+        # H1: bmm(fc1_w [N,64,45], xt [N,45,1]) → [N,64] + bias
+        h1_pre = torch.bmm(fc1_w, xt.unsqueeze(-1)).squeeze(-1) + fc1_b
+        v1 = v1 * decay + h1_pre * inp_scale
+        s1 = (v1 >= threshold).float()
+        v1 = v1 - s1 * threshold   # soft-reset
+
+        # H2: linear + recorrência + LIF
+        h2_pre = torch.bmm(fc2_w,  s1.unsqueeze(-1)).squeeze(-1) + fc2_b
+        h2_rec = torch.bmm(fc2r_w, h2_sp.unsqueeze(-1)).squeeze(-1)
+        v2 = v2 * decay + (h2_pre + h2_rec) * inp_scale
+        s2 = (v2 >= threshold).float()
+        v2 = v2 - s2 * threshold
+        h2_sp = s2.detach()
+
+        # Output: linear + biases KAN + LIF
+        out_pre = torch.bmm(fc3_w, s2.unsqueeze(-1)).squeeze(-1) + fc3_b  # [N,4]
+        out_pre[:, 0] += bias_expt * 0.2
+        out_pre[:, 1] += bias_expl * 0.2
+        out_pre[:, 2] += bias_expl * 0.2
+        v3 = v3 * decay + out_pre * inp_scale
+        s3 = (v3 >= threshold).float()
+        v3 = v3 - s3 * threshold
+
+        spike_out_accum += s3
+        h1_list.append(s1.unsqueeze(0))    # [1, N, 64]
+        h2_list.append(s2.unsqueeze(0))    # [1, N, 32]
+        out_list.append(s3.unsqueeze(0))   # [1, N, 4]
+
+    h1_spikes  = torch.cat(h1_list,  dim=0)   # [T, N, 64]
+    h2_spikes  = torch.cat(h2_list,  dim=0)   # [T, N, 32]
+    out_spikes = torch.cat(out_list, dim=0)   # [T, N, 4]
+
+    # Popular _spike_rates em cada SNN para AGMP.taxa_spikes_media
+    # 2 reduções GPU + 1 CPU transfer cada (vs 160 .item() calls individuais)
+    h1_rates = h1_spikes.mean(dim=2).cpu()   # [T, N]
+    h2_rates = h2_spikes.mean(dim=2).cpu()   # [T, N]
+    for i, snn in enumerate(all_snns):
+        snn._spike_rates_h1 = h1_rates[:, i].tolist()
+        snn._spike_rates_h2 = h2_rates[:, i].tolist()
+
+    return spike_out_accum, h1_spikes, h2_spikes, out_spikes
 
 
 def pretreinar_ann_e_converter(

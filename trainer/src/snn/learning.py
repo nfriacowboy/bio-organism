@@ -17,6 +17,7 @@ e o organismo estabiliza em modo 'inferencia'.
 """
 from __future__ import annotations
 
+import math
 import random
 import torch
 import torch.nn as nn
@@ -24,7 +25,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
-from .network import OrganismoSNN, N_H1, N_H2, N_INPUT, N_OUTPUT
+from .network import OrganismoSNN, N_H1, N_H2, N_INPUT, N_OUTPUT, T_STEPS
 
 
 # ---------------------------------------------------------------------------
@@ -33,8 +34,9 @@ from .network import OrganismoSNN, N_H1, N_H2, N_INPUT, N_OUTPUT
 
 @dataclass
 class ConfigRSTDP:
-    lr_snn: float = 1e-3            # taxa de aprendizagem base
+    lr_snn: float = 5e-3            # taxa de aprendizagem base (aumentado 1e-3→5e-3 v9)
     tau_trace: float = 20.0         # constante de tempo da eligibility trace (ms ~ timesteps)
+    tau_trace_fc3: float = 20.0     # v39: igual a tau_trace — trace longo (revert v38). Eq balanced @p_av=0.33 c/ turn_bonus=0.30
     clip_w: float = 1.0             # clipping máximo dos pesos
     grad_clip: float = 0.5          # clipping do delta_w por step
 
@@ -47,7 +49,7 @@ class ConfigNACA:
     lambda_naca: taxa de esquecimento adaptativo quando o gate está fechado
                  (pouca novidade). Empurra os pesos inativos em direcção a zero.
     """
-    lambda_naca: float = 0.01
+    lambda_naca: float = 0.000001   # 1e-6: ~10% decay total em 500ep (108k steps)
 
 
 @dataclass
@@ -60,8 +62,8 @@ class ConfigAGMP:
     threshold : limiar de novidade (em taxa de spikes) para activar plasticidade.
                 Quando novidade < threshold o organismo entra em modo inferência.
     """
-    tau_slow: float = 100.0
-    threshold: float = 0.3
+    tau_slow: float = 20000.0
+    threshold: float | None = None   # None = calibração automática em ep20 (v16)
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,7 @@ class EligibilityTrace:
         self.tau = tau
         self.device = device or torch.device("cpu")
         self.trace = torch.zeros(shape, device=self.device)
+        self._decay: float = math.exp(-1.0 / self.tau)  # precomputed — avoids tensor alloc every step
 
     def actualizar(self, pre_spikes: torch.Tensor, post_spikes: torch.Tensor) -> None:
         """
@@ -91,8 +94,7 @@ class EligibilityTrace:
         post_mean = post_spikes.mean(dim=(0, 1))   # [n_post]
         corr = torch.outer(post_mean, pre_mean)    # [n_post, n_pre]
         # Decaimento exponencial + acumulação
-        decay = torch.exp(torch.tensor(-1.0 / self.tau))
-        self.trace = decay * self.trace + corr
+        self.trace = self._decay * self.trace + corr
 
     def reset(self) -> None:
         self.trace.zero_()
@@ -165,11 +167,15 @@ class AGMPGate:
     externamente pelo NACAGate.
     """
 
-    def __init__(self, tau_slow: float = 100.0, threshold: float = 0.3):
+    def __init__(self, tau_slow: float = 20000.0, threshold: float | None = None):
         self.astrocyte_var: float = 0.0
         self.tau_slow = tau_slow
-        self.threshold = threshold
-        self.novidade: float = 0.0   # última novidade, acessível externamente
+        self.threshold = threshold          # None = ainda não calibrado
+        self.novidade: float = 0.0          # última novidade (acesso externo)
+        # Fase de observação (v16): medir novelty real antes de activar threshold
+        self.episodio_actual: int = 0
+        self.N_OBSERVACAO: int = 99999      # v43: desactivar AGMP freeze — nunca calibra durante treino (1500ep)
+        self.novelty_hist: list[float] = [] # acumular novelty passo-a-passo
 
     def step(self, spike_rate_actual: float, spike_rate_esperado: float) -> bool:
         """
@@ -184,8 +190,47 @@ class AGMPGate:
         """
         self.astrocyte_var += (spike_rate_actual - self.astrocyte_var) / self.tau_slow
         self.novidade = abs(spike_rate_actual - spike_rate_esperado)
-        plasticidade_activa = self.novidade > self.threshold
-        return plasticidade_activa
+        # Fase de observação: forçar aprendizagem e acumular novelty para calibração
+        if self.episodio_actual < self.N_OBSERVACAO:
+            # N_OBSERVACAO=99999 é sentinel de "nunca calibrar" — não acumular lista infinita
+            if self.N_OBSERVACAO < 99999:
+                self.novelty_hist.append(self.novidade)
+            return True
+        # Threshold ainda não calibrado (v43: N_OBSERVACAO=99999 → nunca chega aqui durante treino)
+        if self.threshold is None:
+            return True
+        return self.novidade > self.threshold
+
+    def fim_episodio(self, episodio_num: int) -> dict | None:
+        """
+        Chamar no fim de cada episódio.
+
+        No ep N_OBSERVACAO (100 em v28): calibra o threshold como percentil 75
+        da novelty observada durante a fase de observação.
+
+        P75 → o organismo aprende nos 25% de steps mais 'surpreendentes',
+        evitando saturação (100% como v14) e extinção (0% como v15).
+
+        Devolve dict com métricas de calibração no ep100, None nos outros eps.
+        """
+        self.episodio_actual = episodio_num
+        if episodio_num == self.N_OBSERVACAO and self.threshold is None:
+            import statistics
+            hist = self.novelty_hist
+            nov_media = statistics.mean(hist)
+            nov_p75   = sorted(hist)[int(len(hist) * 0.75)]
+            self.threshold = nov_p75
+            print(
+                f"[AGMP] Threshold calibrado: {self.threshold:.5f}"
+                f"  (media={nov_media:.5f}, p75={nov_p75:.5f},"
+                f" n={len(hist)} amostras)"
+            )
+            return {
+                "agmp_threshold_calibrado": self.threshold,
+                "novelty_media_obs":        nov_media,
+                "n_amostras_obs":           len(hist),
+            }
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -292,21 +337,36 @@ class RSTDPLearner:
 
         # Estado interno de plasticidade (True = aprendizagem, False = inferência)
         self._plasticidade_activa: bool = True
+        # v4.0: gate externo — controlado pelo trainer com base em CV de recompensa.
+        # Quando True, suspende actualizações de pesos independentemente do AGMP.
+        self._inferencia_forcada: bool = False
 
         # --- Eligibility traces para cada camada ---
-        self.et_fc1 = EligibilityTrace((N_H1, N_INPUT),   self.cfg.tau_trace, self.device)
-        self.et_fc2 = EligibilityTrace((N_H2, N_H1),      self.cfg.tau_trace, self.device)
-        self.et_fc3 = EligibilityTrace((N_OUTPUT, N_H2),  self.cfg.tau_trace, self.device)
+        self.et_fc1 = EligibilityTrace((N_H1, N_INPUT),   self.cfg.tau_trace,     self.device)
+        self.et_fc2 = EligibilityTrace((N_H2, N_H1),      self.cfg.tau_trace,     self.device)
+        self.et_fc3 = EligibilityTrace((N_OUTPUT, N_H2),  self.cfg.tau_trace_fc3, self.device)  # v39: tau_trace_fc3=tau_trace=20
+
+        # Pré-alocado: evita torch.zeros() por step em step() e step_with_precomputed_spikes()
+        self._fake_post: torch.Tensor = torch.zeros(T_STEPS, 1, N_OUTPUT, device=self.device)
 
         # Recompensa acumulada (média exponencial para suavizar)
         self._reward_ema: float = 0.0
         self._reward_tau: float = 10.0
+
+        # Baseline global de recompensa: EMA lenta cross-episódio (não reiniciada).
+        # Subtrai o offset sistemático (step cost + energia) do sinal de aprendizagem,
+        # implementando o erro de predição de recompensa (RPE) dopaminérgico.
+        # Com tau≈10000 steps e step_cost≈-0.031/step, converge em ~50 episódios.
+        self._reward_baseline: float = 0.0
 
         # Spikes capturados pelos hooks no último forward
         self._last_input: torch.Tensor | None = None
         self._last_h1:    torch.Tensor | None = None
         self._last_h2:    torch.Tensor | None = None
         self._last_out:   torch.Tensor | None = None
+
+        # Base lr guardada para warmup (imutável após init)
+        self._lr_snn_base: float = self.cfg.lr_snn
 
         self._instalar_hooks()
 
@@ -319,6 +379,16 @@ class RSTDPLearner:
           'inferencia'   — AGMPGate inactiva, pesos congelados.
         """
         return "aprendizagem" if self._plasticidade_activa else "inferencia"
+
+    def set_modo_externo(self, inferencia: bool) -> None:
+        """
+        Gate de plasticidade externo (v4.0).
+        Chamado pelo trainer com base no CV da recompensa por episódio.
+
+        Quando inferencia=True: R-STDP suspenso (pesos congelados).
+        AGMP e NACA continuam a correr para rastrear taxa de spikes.
+        """
+        self._inferencia_forcada = inferencia
 
     # -------------------------------------------------------------------
     def _instalar_hooks(self) -> None:
@@ -409,18 +479,33 @@ class RSTDPLearner:
         # 2. Actualizar eligibility traces
         self.et_fc1.actualizar(self._last_input, self._last_h1)
         self.et_fc2.actualizar(self._last_h1,    self._last_h2)
-        self.et_fc3.actualizar(self._last_h2,    self._last_out)
+        # v33: fc3 usa one-hot da acção TOMADA (epsilon-greedy), não output interno SNN.
+        # Corrige misalignment: SNN biasado para avançar reforçava avançar mesmo quando
+        # a turn bonus recompensava viragens (et_fc3 correlacionava h2 com avançar interno).
+        if accao is not None:
+            self._fake_post.zero_()
+            self._fake_post[:, 0, accao] = 1.0
+            self.et_fc3.actualizar(self._last_h2, self._fake_post)
+        else:
+            self.et_fc3.actualizar(self._last_h2, self._last_out)
 
         # 3. AGMP: novidade = |taxa_actual - astrocyte_var (expectativa lenta)|
         spike_rate_actual   = self.snn.taxa_spikes_media
         spike_rate_esperado = self.agmp.astrocyte_var        # expectativa antes do update
         self._plasticidade_activa = self.agmp.step(spike_rate_actual, spike_rate_esperado)
+        # v4.0: gate externo override — trainer controla via CV de recompensa
+        if self._inferencia_forcada:
+            self._plasticidade_activa = False
 
-        # Suavizar recompensa (EMA)
-        self._reward_ema += (recompensa - self._reward_ema) / self._reward_tau
+        # Baseline global + EMA de recompensa
+        # Baseline: EMA lenta (tau≈10000) não reiniciada entre episódios.
+        # r_adj = RPE (reward prediction error): sinal centrado em ~0 para comportamento típico.
+        self._reward_baseline += 0.0001 * (recompensa - self._reward_baseline)
+        r_adj = recompensa - self._reward_baseline
+        self._reward_ema += (r_adj - self._reward_ema) / self._reward_tau
 
-        # 4. NACA: sinal neuromodulador = novidade × |recompensa_ema|
-        self.naca.update(self.agmp.novidade, self._reward_ema)
+        # 4. NACA: gate usa recompensa bruta (detecta eventos significativos sem baseline)
+        self.naca.update(self.agmp.novidade, recompensa)
 
         # 5. Actualizar pesos apenas se AGMP indica plasticidade activa
         if self._plasticidade_activa:
@@ -462,6 +547,59 @@ class RSTDPLearner:
             camada.weight.clamp_(-clip_w, clip_w)
 
     # -------------------------------------------------------------------
+    def step_with_precomputed_spikes(
+        self,
+        x_input: torch.Tensor,      # [T, 1, N_INPUT] — input original deste organismo
+        h1: torch.Tensor,           # [T, 1, N_H1]
+        h2: torch.Tensor,           # [T, 1, N_H2]
+        out: torch.Tensor,          # [T, 1, N_OUTPUT]
+        recompensa: float,
+        *,
+        accao: int | None = None,
+    ) -> None:
+        """
+        R-STDP update usando spikes pré-calculados pelo batched_forward_multi_snn.
+        Evita um segundo forward pass redundante — usa as activações já computadas.
+        Chamado pelo trainer_populacao quando device=cuda e N>1.
+        """
+        self._last_input = x_input.detach()
+        self._last_h1    = h1.detach()
+        self._last_h2    = h2.detach()
+        self._last_out   = out.detach()
+
+        # Eligibility traces
+        self.et_fc1.actualizar(self._last_input, self._last_h1)
+        self.et_fc2.actualizar(self._last_h1,    self._last_h2)
+        if accao is not None:
+            self._fake_post.zero_()
+            self._fake_post[:, 0, accao] = 1.0
+            self.et_fc3.actualizar(self._last_h2, self._fake_post)
+        else:
+            self.et_fc3.actualizar(self._last_h2, self._last_out)
+
+        # AGMP: novidade a partir da taxa de spikes (já calculada pelo batched forward)
+        spike_rate_actual   = self.snn.taxa_spikes_media
+        spike_rate_esperado = self.agmp.astrocyte_var
+        self._plasticidade_activa = self.agmp.step(spike_rate_actual, spike_rate_esperado)
+        if self._inferencia_forcada:
+            self._plasticidade_activa = False
+
+        # Reward baseline + EMA
+        self._reward_baseline += 0.0001 * (recompensa - self._reward_baseline)
+        r_adj = recompensa - self._reward_baseline
+        self._reward_ema += (r_adj - self._reward_ema) / self._reward_tau
+
+        # NACA gate
+        self.naca.update(self.agmp.novidade, recompensa)
+
+        # Actualizar pesos (se AGMP activo)
+        if self._plasticidade_activa:
+            self._actualizar_pesos(self._reward_ema)
+
+        # Experience replay — skipped in batch path: WorldRunner never calls consolidar_replay(),
+        # so the 3× cpu().clone() snapshot cost is pure waste here.
+
+    # -------------------------------------------------------------------
     def consolidar_replay(self, batch_size: int = 32) -> None:
         """
         Consolida experiências do buffer offline (fase de "sono").
@@ -477,9 +615,44 @@ class RSTDPLearner:
         self.et_fc3.reset()
         self._reward_ema = 0.0
 
+    # -------------------------------------------------------------------
+    def set_episode(self, ep: int) -> None:
+        """
+        Ajusta parâmetros dinâmicos por episódio.
+
+        Lambda NACA (v42):
+          lambda_naca = 1e-6 SEMPRE.
+          Causa raiz v38-v41: lambda=0.1 eps 1-100 causava decay 10%/step em steps
+          normais (gate≈0.0008 → ΔW≈-0.1×W). fc3 pesos → 0 em ep1. Pré-treino ANN
+          destruído. RSTDP reconstruía pesos do zero com bias avançar (food |r|=1.29).
+
+        LR warmup linear (v16 — correcção de v15):
+          ep 1  : lr_snn × 0.5   (50% — protege sem congelar)
+          ep 50 : lr_snn × 1.0   (100% — aprendizagem plena)
+          ep >50: lr_snn base
+        O warmup cresce linearmente, evitando o congelamento que ocorreu em v15 com ×0.15.
+        """
+        # v42: lambda_naca = 1e-6 sempre (não destruir pesos ANN pretrain)
+        self.naca.lambda_naca = 1e-6
+
+        if ep <= 50:
+            factor = 0.5 + 0.5 * (ep / 50.0)   # linear: 0.5 (ep1) → 1.0 (ep50)
+        else:
+            factor = 1.0
+        self.cfg.lr_snn = self._lr_snn_base * factor
+
+    # -------------------------------------------------------------------
+    def fim_episodio(self, ep: int) -> dict | None:
+        """
+        Chamar no fim de cada episódio (após _correr_episodio).
+        Delega para AGMPGate.fim_episodio — retorna dict de calibração no ep20,
+        None nos restantes episódios.
+        """
+        return self.agmp.fim_episodio(ep)
+
 
 # ---------------------------------------------------------------------------
-# Sinal de recompensa composto (reward shaping) — inalterado de Passo 6
+# Sinal de recompensa — v45: turn_bonus constante, sem TURN-OFF, sem WRONG-ADV
 # ---------------------------------------------------------------------------
 
 def calcular_recompensa(
@@ -488,19 +661,37 @@ def calcular_recompensa(
     dist_comida_antes: float | None,
     dist_comida_depois: float | None,
     morreu: bool,
+    accao_idx: int = 0,
+    accao_esperada: int | None = None,
+    turn_bonus: float = 0.30,
+    avancar_unconditional: float = 0.0,
+    wrong_advance_penalty: float = 0.0,
+    wrong_turn_penalty: float = 0.0,   # v45: 0.0 — v47 mostrou que reduz net turn reinforcement
 ) -> float:
     """
-    Combina o sinal do ambiente com reward shaping adicional.
-    O ambiente (Mundo.step) já inclui: +1.0 comer, -5.0 morte, bónus proximidade.
-    Aqui adicionamos apenas o custo de movimento e bónus de aproximação direcional.
+    Reward shaping v45: turn_bonus constante, lambda=1e-6, AGMP desactivado.
+
+    Equilíbrio natural com turn_bonus=0.30: p_av≈5-10% (turn dominant).
+    Organismo aprende directionality (prec_roll30→0.47) mas p_av baixo.
+    prec_roll30 ainda em crescimento a ep300 (+0.029/50ep) → deixar correr 1500ep.
     """
-    r = recompensa_ambiente
-    r += -0.01   # custo de movimento por step (step de aprendizagem)
-
-    # Bónus de aproximação: recompensa por reduzir distância à comida mais próxima
-    if dist_comida_antes is not None and dist_comida_depois is not None:
-        aproximacao = dist_comida_antes - dist_comida_depois
-        if aproximacao > 0:
-            r += 0.05 * min(aproximacao / 5.0, 1.0)
-
+    r = recompensa_ambiente - 0.01   # custo de movimento por step
+    if accao_idx == 0:               # avançar
+        r += avancar_unconditional
+        # penalizar avançar errado (food lateral visible, organismo avança)
+        if (accao_esperada is not None and accao_esperada != 0):
+            r -= wrong_advance_penalty
+    if accao_esperada is not None and accao_idx == accao_esperada:
+        if accao_esperada == 0:      # avançar frontal (food a 0°)
+            r += 0.30
+        else:                        # viragem lateral (condicionada por turn_bonus)
+            r += turn_bonus
+    # v52: penalizar virar na direcção errada (food lateral, virou ao contrário)
+    # Diferencial correcto→+0.30, errado→-0.10: discriminação 0.40 (vs 0.30 sem pena)
+    if (accao_idx in {1, 2}
+            and accao_esperada is not None
+            and accao_esperada in {1, 2}
+            and accao_idx != accao_esperada):
+        r -= wrong_turn_penalty
     return r
+

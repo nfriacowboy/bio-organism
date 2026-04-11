@@ -6,13 +6,14 @@ Estratégia (spec §2.2):
   2. Pré-treinar o MLP equivalente (_ANNEquivalente) por `epochs` epochs com backprop.
   3. Copiar os pesos treinados para a SNN via converter_ann_para_snn.
 
-Layout do vector de input (18 elementos, intensidades em [0, 1]):
-  [ang-15_curta, ang-15_media, ang-15_longa,
-   ang-7.5_curta, ang-7.5_media, ang-7.5_longa,
-   ang0_curta,   ang0_media,   ang0_longa,
-   ang7.5_curta, ang7.5_media, ang7.5_longa,
-   ang15_curta,  ang15_media,  ang15_longa,
-   energia_norm, tempo_vida_norm, bias=1.0]
+Layout do vector de input v4.0 (45 elementos, intensidades em [0, 1]):
+  [0:15]  visão (5 ângulos × 3 zonas)
+  [15:18] estado (energia_norm, tempo_vida_norm, bias=1.0)
+  [18:22] cópia eferente (one-hot acção anterior — neutro: [0,0,0,1]=parar)
+  [22:37] fluxo óptico   (delta visual — neutro: 0.5 = sem mudança)
+  [37:39] propriocepção  (em_movimento, direcao_rotacao — neutro: [0.0, 0.5])
+  [39:42] olfacto        (esq, frente, dir — neutro: [0.0, 0.0, 0.0])
+  [42:45] feromona       (esq, frente, dir — neutro: [0.0, 0.0, 0.0]) (Fase C)
 
 Acções:
   0 = avancar
@@ -67,6 +68,15 @@ _IDX_ENERGIA    = 15
 _IDX_TEMPO_VIDA = 16
 _IDX_BIAS       = 17
 
+# Índices dos novos neurónios v2.0 (pré-treino usa valores neutros)
+_IDX_EFERENTE_START = 18   # [18:22] one-hot acção anterior — neutro: parar=[0,0,0,1]
+_IDX_FLOW_START     = 22   # [22:37] fluxo óptico          — neutro: 0.5
+_IDX_PROP_START     = 37   # [37:39] propriocepção          — neutro: [0.0, 0.5]
+# v3.0 — olfacto
+_IDX_OLFATO_START   = 39   # [39:42] olfacto               — neutro: [0.0, 0.0, 0.0]
+# v4.0 — feromona (Fase C)
+_IDX_FEROMONA_START = 42   # [42:45] feromona              — neutro: [0.0, 0.0, 0.0]
+
 # Índices de acção (winner-take-all da SNN)
 AVANCAR        = 0
 VIRAR_ESQUERDA = 1
@@ -75,10 +85,10 @@ PARAR          = 3
 
 # Proporções de cada cenário no dataset sintético.
 # sem_comida recebe o restante para garantir que sum == n_amostras exacto.
-_FRAC_FRENTE     = 0.30
+_FRAC_FRENTE     = 0.25   # v30: igualado a esq/dir → distribuição uniforme 33%/33%/33%
 _FRAC_ESQUERDA   = 0.25
 _FRAC_DIREITA    = 0.25
-# _FRAC_SEM_COMIDA = 0.20  (calculado por diferença)
+# _FRAC_SEM_COMIDA = 0.25  (calculado por diferença)
 
 
 # ---------------------------------------------------------------------------
@@ -87,11 +97,26 @@ _FRAC_DIREITA    = 0.25
 
 def _vetor_vazio() -> list[float]:
     """
-    Devolve um vector de 18 zeros com bias=1.0 e estado zero.
-    Todos os slots de visão e energia/tempo_vida começam a zero.
+    Devolve um vector de 42 zeros com bias=1.0, estado zero, e
+    valores neutros para as dimensões v2.0 (eferente/flow/prop) e
+    v3.0 (olfacto=0.0 — sem gradiente químico).
+
+    v30: eferente aleatorio (não sempre parar=3).
+    Durante o treino real a acção anterior é variada — fixar parar=3 criava
+    distribution mismatch → SNN output avançar ~100% fora de distribuição.
     """
-    v = [0.0] * N_INPUT
+    v = [0.0] * N_INPUT   # 45 zeros — inclui [39:42]=0.0 (olfacto) e [42:45]=0.0 (feromona neutros)
     v[_IDX_BIAS] = 1.0
+    # Eferente: aleatorio entre as 4 acções (v30: era sempre parar=3)
+    acc_ant = random.randint(0, 3)
+    v[_IDX_EFERENTE_START + acc_ant] = 1.0
+    # Fluxo óptico neutro: 0.5 (sem mudança visual)
+    for i in range(15):
+        v[_IDX_FLOW_START + i] = 0.5
+    # Propriocepção neutra: não em movimento, sem rotação
+    v[_IDX_PROP_START]     = 0.0   # em_movimento=False
+    v[_IDX_PROP_START + 1] = 0.5   # direcao_rotacao=neutral
+    # Olfacto neutro: [39:42] já são 0.0 (inicializados por [0.0] * N_INPUT)
     return v
 
 
@@ -154,7 +179,7 @@ def _amostra_frente() -> tuple[list[float], int]:
     """
     Comida directamente em frente (ângulo 0.0), zona curta ou media.
     Acção correcta: avancar (0).
-    Variação de intensidade para robustez do treino.
+    Olfacto: frente≈0.44-0.60 (sector dominante), esq/dir≈0.15-0.28 — normalização relativa v4.0.
     """
     v = _vetor_vazio()
     # Escolher aleatoriamente entre curta e media com igual probabilidade
@@ -163,6 +188,10 @@ def _amostra_frente() -> tuple[list[float], int]:
     else:
         _colocar_comida(v, 0.0, _OFFSET_MEDIA, _intensidade_media())
     v[_IDX_ENERGIA], v[_IDX_TEMPO_VIDA] = _estado_aleatorio()
+    # v4.0: olfacto relativo-normalizado — frente dominante, esq/dir proporcionais
+    v[_IDX_OLFATO_START]     = random.uniform(0.15, 0.28)   # esq
+    v[_IDX_OLFATO_START + 1] = random.uniform(0.44, 0.60)   # frente (dominante)
+    v[_IDX_OLFATO_START + 2] = random.uniform(0.15, 0.28)   # dir
     return v, AVANCAR
 
 
@@ -170,7 +199,7 @@ def _amostra_esquerda() -> tuple[list[float], int]:
     """
     Comida à esquerda (ângulo -7.5 ou -15.0), zona curta ou media.
     Acção correcta: virar_esquerda (1).
-    Ambos os ângulos de esquerda são usados para cobrir o campo visual esquerdo.
+    Olfacto: esq≈0.44-0.60 (sector dominante), frente/dir≈0.15-0.28 — normalização relativa v4.0.
     """
     v = _vetor_vazio()
     angulo = random.choice([-7.5, -15.0])
@@ -179,6 +208,10 @@ def _amostra_esquerda() -> tuple[list[float], int]:
     else:
         _colocar_comida(v, angulo, _OFFSET_MEDIA, _intensidade_media())
     v[_IDX_ENERGIA], v[_IDX_TEMPO_VIDA] = _estado_aleatorio()
+    # v4.0: olfacto relativo-normalizado — esq dominante
+    v[_IDX_OLFATO_START]     = random.uniform(0.44, 0.60)   # esq (dominante)
+    v[_IDX_OLFATO_START + 1] = random.uniform(0.15, 0.28)   # frente
+    v[_IDX_OLFATO_START + 2] = random.uniform(0.15, 0.28)   # dir
     return v, VIRAR_ESQUERDA
 
 
@@ -186,7 +219,7 @@ def _amostra_direita() -> tuple[list[float], int]:
     """
     Comida à direita (ângulo +7.5 ou +15.0), zona curta ou media.
     Acção correcta: virar_direita (2).
-    Ambos os ângulos de direita são usados para cobrir o campo visual direito.
+    Olfacto: dir≈0.44-0.60 (sector dominante), esq/frente≈0.15-0.28 — normalização relativa v4.0.
     """
     v = _vetor_vazio()
     angulo = random.choice([7.5, 15.0])
@@ -195,6 +228,10 @@ def _amostra_direita() -> tuple[list[float], int]:
     else:
         _colocar_comida(v, angulo, _OFFSET_MEDIA, _intensidade_media())
     v[_IDX_ENERGIA], v[_IDX_TEMPO_VIDA] = _estado_aleatorio()
+    # v4.0: olfacto relativo-normalizado — dir dominante
+    v[_IDX_OLFATO_START]     = random.uniform(0.15, 0.28)   # esq
+    v[_IDX_OLFATO_START + 1] = random.uniform(0.15, 0.28)   # frente
+    v[_IDX_OLFATO_START + 2] = random.uniform(0.44, 0.60)   # dir (dominante)
     return v, VIRAR_DIREITA
 
 
@@ -203,8 +240,10 @@ def _amostra_sem_comida() -> tuple[list[float], int]:
     Sem comida visível: todos os ângulos em zona longa com sinal fraco (≈0.1),
     consistente com o sinal de fundo produzido por vision.py para zona longa.
 
-    Acção: avancar (60%) ou acção aleatória (40%) para ensinar exploração
-    quando não há estímulo direcional claro.
+    Acção: uniforme entre as 3 acções motoras — sem PARAR nos labels de treino.
+    (v30: usar randint(0,2) para que a distribuição final seja exactamente 33%/33%/33%.
+     randint(0,3) incluía PARAR=3 → distribuição desequilibrada 35%/30%/30%/5% →
+     ANN aprend bias para avancar → SNN iniciava com p_av≈70%.)
     """
     v = _vetor_vazio()
     # Sinal fraco de zona longa em todos os ângulos
@@ -212,8 +251,8 @@ def _amostra_sem_comida() -> tuple[list[float], int]:
         _colocar_comida(v, angulo, _OFFSET_LONGA, random.uniform(0.05, 0.15))
     # Estado variável incluindo energia baixa para cobrir mais cenários
     v[_IDX_ENERGIA], v[_IDX_TEMPO_VIDA] = _estado_aleatorio(energia_min=0.1)
-    # 60% avancar (comportamento por omissão), 40% acção aleatória
-    label = AVANCAR if random.random() < 0.60 else random.randint(0, 3)
+    # Distribuição uniforme sobre 3 acções motoras (sem PARAR — v30)
+    label = random.randint(0, 2)
     return v, label
 
 
@@ -232,10 +271,11 @@ def gerar_dados_sinteticos(
     rate-coded, sem necessidade de simulação do mundo.
 
     Distribuição de cenários:
-      30% comida em frente   → avancar
+      25% comida em frente   → avancar
       25% comida à esquerda → virar_esquerda
       25% comida à direita  → virar_direita
-      20% sem comida visível → avancar (60%) / aleatório (40%)
+      25% sem comida visível → uniform{0,1,2} (sem PARAR)
+    Distribuição efectiva de labels: 33.3% por acção motora (v30: equilibrado)
 
     Parâmetros
     ----------
@@ -244,7 +284,7 @@ def gerar_dados_sinteticos(
 
     Devolve
     -------
-    x : torch.Tensor shape [n_amostras, 18], dtype=float32
+    x : torch.Tensor shape [n_amostras, 42], dtype=float32
         Intensidades rate-coded (valores em [0, 1]) — input directo para o ANN
     y : torch.Tensor shape [n_amostras],     dtype=int64
         Índices de acção (0=avancar, 1=virar_esquerda, 2=virar_direita, 3=parar)
@@ -273,7 +313,7 @@ def gerar_dados_sinteticos(
 
     vetores, labels = zip(*amostras)
 
-    x = torch.tensor(list(vetores), dtype=torch.float32, device=dev)  # [N, 18]
+    x = torch.tensor(list(vetores), dtype=torch.float32, device=dev)  # [N, 42]
     y = torch.tensor(list(labels),  dtype=torch.int64,   device=dev)  # [N]
 
     return x, y

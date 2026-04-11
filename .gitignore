@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Claude Code local settings (personal overrides)
+.claude/settings.local.json
+
 # Python
 __pycache__/
 *.py[cod]
@@ -22,6 +25,12 @@ mlartifacts/
 # PyTorch / modelos
 *.pt
 *.pth
+
+# Launch scripts históricos de treino (usar launch_multi_world.sh, launch_dashboard.sh, etc.)
+launch_v*.sh
+
+# Exports de treino (gerados automaticamente, podem ser grandes)
+exports/
 
 # Misc
 .DS_Store

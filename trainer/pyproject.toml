@@ -17,6 +17,8 @@ dependencies = [
     "mlflow>=2.14.0",
     "pydantic>=2.0.0",
     "python-dotenv>=1.0.0",
+    "plotext>=5.2.0",
+    "scipy>=1.11.0",
 ]
 
 [tool.uv.sources]
@@ -25,3 +27,4 @@ torch = { index = "rocm" }
 [[tool.uv.index]]
 name = "rocm"
 url = "https://download.pytorch.org/whl/rocm6.3"
+explicit = true

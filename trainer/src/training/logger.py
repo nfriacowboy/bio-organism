@@ -259,3 +259,121 @@ class TreinoManager:
                 )
         except Exception as exc:
             raise RuntimeError(f"TreinoManager.update_estado failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# EpisodioLogger
+# ---------------------------------------------------------------------------
+
+_INSERT_EPISODIO_SQL = text("""
+    INSERT INTO episodios_log (
+        treino_id, episodio,
+        tempo_vida, comida, eficiencia, recompensa_total,
+        taxa_inferencia, novidade_media,
+        bias_explorar_medio, bias_exploitar_medio,
+        fase_curriculum, morreu,
+        precisao_direcional, steps_com_visao, taxa_perseguicao,
+        seed, p_avancar,
+        modo_plasticidade
+    ) VALUES (
+        :treino_id, :episodio,
+        :tempo_vida, :comida, :eficiencia, :recompensa_total,
+        :taxa_inferencia, :novidade_media,
+        :bias_explorar_medio, :bias_exploitar_medio,
+        :fase_curriculum, :morreu,
+        :precisao_direcional, :steps_com_visao, :taxa_perseguicao,
+        :seed, :p_avancar,
+        :modo_plasticidade
+    )
+    ON CONFLICT (treino_id, episodio) DO UPDATE SET
+        tempo_vida            = EXCLUDED.tempo_vida,
+        comida                = EXCLUDED.comida,
+        eficiencia            = EXCLUDED.eficiencia,
+        recompensa_total      = EXCLUDED.recompensa_total,
+        taxa_inferencia       = EXCLUDED.taxa_inferencia,
+        novidade_media        = EXCLUDED.novidade_media,
+        bias_explorar_medio   = EXCLUDED.bias_explorar_medio,
+        bias_exploitar_medio  = EXCLUDED.bias_exploitar_medio,
+        fase_curriculum       = EXCLUDED.fase_curriculum,
+        morreu                = EXCLUDED.morreu,
+        precisao_direcional   = EXCLUDED.precisao_direcional,
+        steps_com_visao       = EXCLUDED.steps_com_visao,
+        taxa_perseguicao      = EXCLUDED.taxa_perseguicao,
+        seed                  = EXCLUDED.seed,
+        p_avancar             = EXCLUDED.p_avancar,
+        modo_plasticidade     = EXCLUDED.modo_plasticidade
+""")
+
+
+class EpisodioLogger:
+    """
+    Persiste métricas por episódio na tabela episodios_log.
+
+    Garante que precisao_direcional, taxa_perseguicao e todas as métricas
+    calculadas pelo trainer ficam na BD (single source of truth).
+
+    Usage::
+
+        logger = EpisodioLogger(treino_id="2026-03-15T...")
+        logger.log_episodio(episodio=42, metricas={...})
+        logger.close()
+    """
+
+    def __init__(self, treino_id: str, database_url: str | None = None) -> None:
+        self.treino_id = treino_id
+        url = database_url or os.environ.get("DATABASE_URL")
+        if not url:
+            raise ValueError("DATABASE_URL must be set in the environment or passed explicitly.")
+        try:
+            self._engine = create_engine(url, pool_pre_ping=True)
+        except Exception as exc:
+            raise ConnectionError(
+                f"EpisodioLogger: cannot connect to database — {exc}"
+            ) from exc
+
+    # ------------------------------------------------------------------
+    def log_episodio(self, episodio: int, metricas: dict) -> None:
+        """
+        Persiste as métricas de um episódio.
+
+        Chaves esperadas em ``metricas`` (todas opcionais — default 0/None):
+            tempo_vida, comida, eficiencia, recompensa_total,
+            taxa_inferencia, novidade_media,
+            bias_explorar_medio, bias_exploitar_medio,
+            fase_curriculum, morreu,
+            precisao_direcional, steps_com_visao, taxa_perseguicao,
+            seed
+        """
+        params = {
+            "treino_id":            self.treino_id,
+            "episodio":             int(episodio),
+            "tempo_vida":           int(metricas.get("tempo_vida", 0)),
+            "comida":               int(metricas.get("comida", 0)),
+            "eficiencia":           float(metricas.get("eficiencia", 0.0)),
+            "recompensa_total":     float(metricas.get("recompensa_total", 0.0)),
+            "taxa_inferencia":      float(metricas.get("taxa_inferencia", 0.0)),
+            "novidade_media":       float(metricas["novidade_media"]) if metricas.get("novidade_media") is not None else None,
+            "bias_explorar_medio":  float(metricas["bias_explorar_medio"]) if metricas.get("bias_explorar_medio") is not None else None,
+            "bias_exploitar_medio": float(metricas["bias_exploitar_medio"]) if metricas.get("bias_exploitar_medio") is not None else None,
+            "fase_curriculum":      int(metricas.get("fase_curriculum", 1)),
+            "morreu":               bool(metricas.get("morreu", False)),
+            "precisao_direcional":  float(metricas["precisao_direcional"]) if metricas.get("precisao_direcional") is not None else None,
+            "steps_com_visao":      int(metricas.get("steps_com_visao", 0)),
+            "taxa_perseguicao":     float(metricas["taxa_perseguicao"]) if metricas.get("taxa_perseguicao") is not None else None,
+            "seed":                 int(metricas["seed"]) if metricas.get("seed") is not None else None,
+            "p_avancar":            float(metricas["p_avancar"]) if metricas.get("p_avancar") is not None else None,
+            "modo_plasticidade":    str(metricas.get("modo_plasticidade", "aprendizagem")),
+        }
+        try:
+            with self._engine.begin() as conn:
+                conn.execute(_INSERT_EPISODIO_SQL, params)
+        except Exception as exc:
+            raise RuntimeError(f"EpisodioLogger.log_episodio failed: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        """Liberta a ligação à BD."""
+        try:
+            self._engine.dispose()
+        except Exception:
+            pass

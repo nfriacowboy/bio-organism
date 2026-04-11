@@ -1,12 +1,12 @@
 """
 config.py — Configuração do módulo de exportação.
 
-Lê treino_id, liga a DB e MLflow, cria directoria de output.
+Lê treino_id, liga a DB e define o ficheiro JSON de output.
 """
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from sqlalchemy import create_engine, text
@@ -22,47 +22,30 @@ class ExportConfig:
     treino_id :
         ID ISO8601 do treino a exportar.
     output_dir :
-        Pasta raiz de output (default: ``exports/``).
-    apenas :
-        Lista de exportadores a activar. None = todos.
+        Pasta de output (default: ``exports/``).
     episodios_amostra :
-        Quantos episódios de referência exportar.
+        Quantos episódios de referência incluir nos logs de comportamento.
     max_steps_por_episodio :
-        Limite de steps por episódio (evita ficheiros gigantes).
-    incluir_modelos :
-        Se True, copia os .pt dos modelos para o output.
+        Limite de steps por episódio (evita JSONs gigantes).
     """
-
-    ALL_EXPORTERS = ("metricas", "comportamento", "snn", "kan", "espacial")
 
     def __init__(
         self,
         treino_id: str,
         output_dir: str = "exports",
-        apenas: list[str] | None = None,
         episodios_amostra: int = 5,
         max_steps_por_episodio: int = 50_000,
+        # parâmetros legados ignorados (mantidos para compatibilidade de chamadas)
+        apenas: object = None,
         incluir_modelos: bool = False,
     ) -> None:
         self.treino_id = treino_id
         self.episodios_amostra = episodios_amostra
         self.max_steps_por_episodio = max_steps_por_episodio
-        self.incluir_modelos = incluir_modelos
-        self.apenas = set(apenas) if apenas else set(self.ALL_EXPORTERS)
 
-        # Pasta de output
-        base = Path(output_dir) / treino_id
-        if base.exists():
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-            base = Path(output_dir) / f"{treino_id}_{ts}"
-        self.output_dir: Path = base
+        self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Sub-pastas por categoria
-        for cat in ("metricas", "comportamento", "snn", "kan", "espacial"):
-            (self.output_dir / cat).mkdir(exist_ok=True)
-
-        # SQLAlchemy engine
         db_url = os.getenv("DATABASE_URL", "")
         if not db_url:
             raise EnvironmentError(
@@ -70,13 +53,19 @@ class ExportConfig:
                 "Defina a variável de ambiente antes de correr o exportador."
             )
         self.engine: Engine = create_engine(db_url, pool_pre_ping=True)
-        # Quick check
         with self.engine.connect() as c:
             c.execute(text("SELECT 1"))
 
-    def cat(self, categoria: str) -> Path:
-        """Devolve o path da sub-pasta de uma categoria."""
-        return self.output_dir / categoria
+    @property
+    def treino_id_sanitizado(self) -> str:
+        """Converte ISO8601 para nome de ficheiro seguro: 20260315T134709UTC"""
+        try:
+            dt = datetime.fromisoformat(self.treino_id)
+            return dt.strftime("%Y%m%dT%H%M%S") + "UTC"
+        except ValueError:
+            return self.treino_id.replace(":", "").replace("-", "").replace("+", "")
 
-    def enabled(self, nome: str) -> bool:
-        return nome in self.apenas
+    @property
+    def output_file(self) -> Path:
+        """Caminho completo para o ficheiro JSON de output."""
+        return self.output_dir / f"{self.treino_id_sanitizado}_export.json"

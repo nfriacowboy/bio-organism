@@ -27,8 +27,8 @@ Comunicação com a SNN
 ---------------------
   A cada N=10 steps:
     bias_mod = kan.forward(estado_global)   # shape [2]
-    snn.bias_explorar  += bias_mod[0] * 0.2
-    snn.bias_exploitar += bias_mod[1] * 0.2
+    snn.bias_explorar  = bias_mod[0] * 0.3
+    snn.bias_exploitar = bias_mod[1] * 0.3
 
 Inicialização com directivas comportamentais
 --------------------------------------------
@@ -287,8 +287,8 @@ class KANPolicy:
         contador atinge um múltiplo de N=10.
 
         Regra de actualização (conforme spec §8):
-            snn.bias_explorar  += bias_mod[0] * 0.2
-            snn.bias_exploitar += bias_mod[1] * 0.2
+            snn.bias_explorar  += bias_mod[0] * 0.3
+            snn.bias_exploitar += bias_mod[1] * 0.3
 
         Parâmetros
         ----------
@@ -304,8 +304,8 @@ class KANPolicy:
         with torch.no_grad():
             bias_mod = self.forward(estado)   # [2], valores em [0,1]
 
-        snn.bias_explorar  += bias_mod[0].item() * 0.2
-        snn.bias_exploitar += bias_mod[1].item() * 0.2
+        snn.bias_explorar  = bias_mod[0].item() * 0.3
+        snn.bias_exploitar = bias_mod[1].item() * 0.3
 
     # ------------------------------------------------------------------
     @staticmethod
