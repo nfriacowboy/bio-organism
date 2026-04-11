@@ -15,7 +15,7 @@ O projecto divide-se em duas fases principais:
 1. **Treino do organismo individual**: aprendizagem de navegação olfactiva num ambiente esparso com aprendizagem hebbiana modulada por recompensa (R-STDP).
 2. **Simulação multi-organismo**: múltiplos mundos paralelos com reprodução, senescência, territorialidade e dinâmica alpha.
 
-**Resultado central já demonstrado**: o organismo treinado (v80p) atinge **23× acima do baseline aleatório** na fase mais esparsa (0.15% de comida em 1000×1000). Em simulações multi-organismo, confirmámos emergência tribal com **4–5 territórios DBSCAN distintos** por mundo e **filhos_ratio 3–5×** entre alpha e organismos ordinários, em linha com a literatura primata (Sapolsky 2005).
+**Resultado central já demonstrado**: o organismo treinado (v80p) atinge **23× acima do baseline aleatório** na fase mais esparsa (0.15% de comida em 1000×1000). Em simulações multi-organismo, validámos a calibração do substrato com métricas da literatura primata: **4–5 territórios DBSCAN distintos** por mundo e **filhos_ratio 3–5×** entre alpha e organismos ordinários, consistente com a dinâmica reprodutiva documentada em primatas (Sapolsky 2005).
 
 ---
 
@@ -94,11 +94,11 @@ Transição via CV (coeficiente de variação) da recompensa numa janela desliza
 
 ### 2.3 KAN: Política de Exploração/Exploração
 
-Sobre a saída da SNN actua uma **Kolmogorov–Arnold Network (KAN)** de dimensão reduzida que aprende a injectar bias de exploração vs. exploração:
+Sobre a saída da SNN actua uma **Kolmogorov–Arnold Network (KAN)** de dimensão reduzida que aprende a injectar bias de exploração vs. exploração durante o treino individual:
 - `bias_exploitar × 0.2` → neurónio 0 (avancar)
 - `bias_explorar × 0.2` → neurónios 1 e 2 (virar)
 
-Este mecanismo permite ao organismo ajustar dinamicamente o trade-off entre explorar (virar) e exploitar (avançar) consoante o estado interno e o historial.
+Este mecanismo permite ao organismo ajustar dinamicamente o trade-off entre explorar (virar) e exploitar (avançar) consoante o estado interno e o historial. **Nota**: a aprendizagem KAN (actualização dos pesos B-spline) ocorre exclusivamente durante o treino individual; em simulação multi-organismo a KAN opera com pesos fixos herdados do treino, sem actualização adicional.
 
 ---
 
@@ -135,7 +135,7 @@ Ao longo de ~80 versões de treino identificámos e corrigimos as seguintes caus
 |--------|----------|-----|
 | v25-v50 | threshold_lif demasiado alto (0.15) → 100% neurónios mortos | threshold=0.01 |
 | v42 | lambda_naca errado → instabilidade | lambda_naca=1e-6 fixo |
-| v43 | AGMP N_OBSERVACAO=50 → recalibração constante | N_OBSERVACAO=99999 (desactivado) |
+| v43 | AGMP N_OBSERVACAO=50 → recalibração constante destabilizava treino | N_OBSERVACAO=99999 (AGMP retido para compatibilidade futura; gate operacional activo = CV de recompensa por episódio) |
 | v55 | Sem sinal negativo → organismo aprende a virar em loop | WRONG-ADV penalty dinâmico |
 | v63 | Reward shaping igual em todas as fases | Shaping condicional por fase |
 | v65 | Fase 3 atingida mas comida=0 | ANN pré-treino com olfato sintético |
@@ -171,7 +171,7 @@ O organismo treinado (2026 eps, treino_id: `2026-03-26T12:31:30.554186+00:00` + 
 | 2 | 50 | 11.4 | 45 | 1114 |
 | 3 | 1707 | **20.7** | **101** | **2903** |
 
-**Baseline aleatório em fase 3** (1000×1000, 3.75% densidade, random walk): ~0.9 food/episódio.
+**Baseline aleatório em fase 3** (1000×1000, **0.15% densidade** — 1500 alimentos / 1,000,000 células, random walk): ~0.9 food/episódio *(estimado; medição sistemática via sistema de experimentos — ver Secção 9)*.
 
 **v80p vs. aleatório**: 20.7 / 0.9 = **23× acima do baseline**.
 
@@ -326,7 +326,7 @@ Todos os mundos partilham um servidor de inferência GPU (`InferenceServer`):
 Implementação do mecanismo alpha (excursão cross-territorial P=0.20, conflito, filho no midpoint).
 
 **Resultados:**
-- alpha_ratio=3.5–6.3× (Sapolsky 2005 previu 3–4×) ✓
+- alpha_ratio=3.5–6.3× (Sapolsky 2005: 3–4× em primatas — substrato calibrado dentro do intervalo biológico) ✓
 - 29–37% organismos nascidos em zona neutra ✓
 - DBSCAN(eps=40): 3–7 clusters/mundo ✓
 
@@ -356,7 +356,7 @@ Implementação do mecanismo alpha (excursão cross-territorial P=0.20, conflito
 | 6 | 25 | 8 | 329 | 7.33 |
 
 **Confirmações científicas:**
-- filhos_ratio 3.14–4.94× (Sapolsky 2005 previu 3–4×) ✓
+- filhos_ratio 3.14–4.94× (Sapolsky 2005: 3–4× em primatas — valida calibração do substrato: dinâmica reprodutiva compatível com populações biológicas) ✓
 - Cross-territory rastreável via coluna `is_cross_territory` na BD ✓
 - 4–5 tribos DBSCAN por mundo ✓ (H0 rejeitada: não aleatorio)
 - Deslocamento activo toda a simulação quando n=4,6 (pop persistentemente acima MAX_POP=25)
@@ -574,13 +574,16 @@ O sistema demonstra comportamentos emergentes biologicamente plausíveis sem que
 
 2. **Patch state no dashboard**: o dashboard mostra o estado do patch na última snapshot, não o estado histórico por frame. Limitação visual sem impacto nos dados.
 
-3. **Tribal clustering**: o DBSCAN usa posições estáticas de snapshot — tribos são definidas espacialmente (onde os organismos estão), não geneticamente (quem é descendente de quem). A correlação é forte mas não perfeita.
+3. **Tribal clustering**: o DBSCAN usa posições estáticas de snapshot — tribos são definidas espacialmente (onde os organismos estão), não geneticamente (quem é descendente de quem). A correlação é forte mas não perfeita. A definição operacional rigorosa (cosine_sim fc1 > 0.90 + proximidade geográfica) está em desenvolvimento.
+
+4. **Baseline não medido**: o valor "23×" usa um baseline de ~0.9 food/ep *estimado* para random walk em fase 3. A medição sistemática (50-100 runs de random walk na mesma configuração) está planeada no sistema de experimentos.
 
 4. **Python GIL**: cada WorldRunner corre numa thread Python. Com 100+ mundos, a contenção do GIL limita o throughput. Fix futuro: multiprocessing ou Rust workers.
 
 ### 9.3 Próximos Passos Propostos
 
 **Curto prazo:**
+- **Sistema de baseline e experimentos**: infrastructure DB para rastrear baseline por simulação, registo de parâmetros alterados, justificação, resultado esperado e critérios de validação — com enforcement via trigger PostgreSQL. Medição sistemática do random walk baseline (50-100 runs).
 - Análise DBSCAN post-hoc com `analyse_tribal.py` nos resultados actuais
 - Correlação gen_max × diversidade inter-tribal (separação espacial entre clusters)
 

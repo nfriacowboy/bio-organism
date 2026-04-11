@@ -122,6 +122,68 @@ def _load_simulacoes(url: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60)
+def _load_sim_experiment(url: str, simulacao_id: str) -> dict:
+    """Retorna informação de experimento/baseline para uma simulação."""
+    conn = _get_conn(url)
+    df = _query(conn, """
+        SELECT s.experimento_id, s.baseline_id,
+               e.nome AS exp_nome, e.estado AS exp_estado,
+               e.criterios_atingidos, e.parametros_alterados,
+               e.justificacao, e.resultado_esperado,
+               b.nome AS baseline_nome, b.tipo AS baseline_tipo
+        FROM simulacoes s
+        LEFT JOIN experimentos e ON e.experimento_id = s.experimento_id
+        LEFT JOIN baselines    b ON b.baseline_id    = COALESCE(s.baseline_id, e.baseline_id)
+        WHERE s.simulacao_id = %s
+    """, (simulacao_id,))
+    if df.empty:
+        return {}
+    return df.iloc[0].to_dict()
+
+
+@st.cache_data(ttl=60)
+def _load_baselines(url: str) -> pd.DataFrame:
+    """Lista todas as baselines disponíveis."""
+    conn = _get_conn(url)
+    return _query(conn, """
+        SELECT b.baseline_id, b.nome, b.tipo, b.simulacao_id,
+               b.metricas_referencia, b.criado_em
+        FROM baselines b ORDER BY b.criado_em DESC
+    """)
+
+
+@st.cache_data(ttl=60)
+def _load_baseline_log(url: str, simulacao_id: str, mundo_id: int) -> pd.DataFrame:
+    """Carrega mundos_log de uma simulação baseline para overlay."""
+    conn = _get_conn(url)
+    return _query(conn, """
+        SELECT t_s, n_vivos, gen_max, cv_fc1
+        FROM mundos_log
+        WHERE simulacao_id = %s AND mundo_id = %s
+        ORDER BY t_s
+    """, (simulacao_id, mundo_id))
+
+
+@st.cache_data(ttl=60)
+def _load_experimentos(url: str) -> pd.DataFrame:
+    """Lista experimentos com info de baseline."""
+    conn = _get_conn(url)
+    return _query(conn, """
+        SELECT e.experimento_id, e.nome, e.estado,
+               e.criterios_atingidos, e.criado_em, e.concluido_em,
+               e.simulacao_id, e.parametros_alterados,
+               e.justificacao, e.resultado_esperado,
+               e.criterios_validacao, e.resultado_real,
+               b.nome AS baseline_nome, b.tipo AS baseline_tipo
+        FROM experimentos e
+        JOIN baselines b ON b.baseline_id = e.baseline_id
+        ORDER BY e.criado_em DESC
+        LIMIT 50
+    """)
+
+
+
+@st.cache_data(ttl=60)
 def _load_mundos_config(url: str, simulacao_id: str) -> pd.DataFrame:
     conn = _get_conn(url)
     return _query(conn, """
@@ -970,7 +1032,7 @@ st.divider()
 
 df_sims = _load_simulacoes(db_url)
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Métricas de População", "🗺️ Mapa Tribal", "🧬 Evolução Genética", "🌍 Multi-Mundo"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Métricas de População", "🗺️ Mapa Tribal", "🧬 Evolução Genética", "🌍 Multi-Mundo", "🧪 Experimentos"])
 
 # ---- Tab 1: Métricas -------------------------------------------------------
 with tab1:
@@ -1150,6 +1212,36 @@ with tab4:
         with col_sim:
             sim_sel = st.selectbox("Simulação", options=df_sims["simulacao_id"].tolist(),
                                    format_func=lambda s: s)
+
+        # Badge experimento/baseline
+        exp_info = _load_sim_experiment(db_url, sim_sel) if sim_sel else {}
+        if exp_info.get("exp_nome"):
+            ok = exp_info.get("criterios_atingidos")
+            badge = "✓ PASS" if ok is True else ("✗ FAIL" if ok is False else "⏳")
+            estado = exp_info.get("exp_estado", "")
+            st.info(f"🧪 **EXPERIMENTO**: {exp_info['exp_nome']}  |  Baseline: "
+                    f"**{exp_info.get('baseline_nome', '?')}**  |  Estado: {estado}  {badge}")
+        elif exp_info.get("baseline_nome") and not exp_info.get("exp_nome"):
+            st.success(f"📌 **BASELINE**: {exp_info.get('baseline_nome')}  "
+                       f"({exp_info.get('baseline_tipo', '')})")
+        elif sim_sel and sim_sel.startswith("UNDOCUMENTED") or (
+            sim_sel and not exp_info.get("exp_nome") and not exp_info.get("baseline_nome")
+        ):
+            nota = df_sims[df_sims.simulacao_id == sim_sel]["nota"].values
+            if len(nota) and str(nota[0]).startswith("UNDOCUMENTED"):
+                st.warning("⚠️ **UNDOCUMENTED RUN** — sem baseline ou experimento declarado")
+
+        # Selector baseline para overlay
+        df_bls = _load_baselines(db_url)
+        bl_opts = ["(nenhum)"] + df_bls["nome"].tolist() if not df_bls.empty else ["(nenhum)"]
+        bl_sel_nome = st.selectbox("Baseline para comparação (overlay)",
+                                   options=bl_opts,
+                                   help="Sobrepõe os dados da baseline nos gráficos como linhas tracejadas")
+        bl_sim_id = None
+        if bl_sel_nome != "(nenhum)" and not df_bls.empty:
+            bl_row = df_bls[df_bls["nome"] == bl_sel_nome]
+            if not bl_row.empty:
+                bl_sim_id = bl_row.iloc[0]["simulacao_id"]
         df_mcfg = _load_mundos_config(db_url, sim_sel)
         with col_mundo:
             mundo_opts = df_mcfg["mundo_id"].tolist()
@@ -1200,24 +1292,146 @@ with tab4:
                 html_canvas = _build_canvas_html(sim_json, narrative_html, canvas_px=560)
                 st.components.v1.html(html_canvas, height=640, scrolling=False)
 
-                # Gráficos de série temporal
+                # Gráficos de série temporal com overlay baseline opcional
                 if not df_log.empty:
+                    df_bl_log = (
+                        _load_baseline_log(db_url, bl_sim_id, mundo_id)
+                        if bl_sim_id else pd.DataFrame()
+                    )
                     tc1, tc2, tc3 = st.columns(3)
+
+                    def _chart_with_baseline(df_main, df_bl, col_y, title, color):
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=df_main["t_s"], y=df_main[col_y],
+                            name="actual", line=dict(color=color),
+                        ))
+                        if not df_bl.empty and col_y in df_bl.columns:
+                            fig.add_trace(go.Scatter(
+                                x=df_bl["t_s"], y=df_bl[col_y],
+                                name="baseline", line=dict(color="rgba(180,180,180,0.7)", dash="dash"),
+                            ))
+                        fig.update_layout(
+                            title=title, template="plotly_dark",
+                            xaxis_title="Tempo (s)",
+                            legend=dict(orientation="h", yanchor="top", y=1.12),
+                            margin=dict(t=60, b=30),
+                        )
+                        return fig
+
                     tc1.plotly_chart(
-                        px.line(df_log, x="t_s", y="n_vivos", title="Organismos vivos",
-                                template="plotly_dark", labels={"t_s": "Tempo (s)"}),
+                        _chart_with_baseline(df_log, df_bl_log, "n_vivos",
+                                             "Organismos vivos", "#4CAF50"),
                         use_container_width=True,
                     )
                     tc2.plotly_chart(
-                        px.line(df_log, x="t_s", y="gen_max", title="Geração máx",
-                                template="plotly_dark", labels={"t_s": "Tempo (s)"}),
+                        _chart_with_baseline(df_log, df_bl_log, "gen_max",
+                                             "Geração máx", "#FF9800"),
                         use_container_width=True,
                     )
                     tc3.plotly_chart(
-                        px.line(df_log, x="t_s", y="cv_fc1", title="Diversidade cv_fc1",
-                                template="plotly_dark", labels={"t_s": "Tempo (s)"}),
+                        _chart_with_baseline(df_log, df_bl_log, "cv_fc1",
+                                             "Diversidade cv_fc1", "#2196F3"),
                         use_container_width=True,
                     )
+
+# ---- Tab 5: Experimentos ---------------------------------------------------
+with tab5:
+    import json as _json5
+
+    df_exps = _load_experimentos(db_url)
+
+    if df_exps.empty:
+        st.info(
+            "Nenhum experimento registado ainda.\n\n"
+            "**Como registar:**\n"
+            "```bash\n"
+            "# 1. Criar baseline a partir de uma simulação existente\n"
+            "python3 -m scripts.create_baseline \\\n"
+            "    --simulacao_id <id> --nome sweep_v1 --tipo experiment_control\n\n"
+            "# 2. Criar ficheiro de experimento (copiar experiments/template.json)\n"
+            "# 3. Registar antes do run\n"
+            "DATABASE_URL=... python3 -m scripts.create_experiment --file experiments/exp_001.json\n\n"
+            "# 4. Correr com SNN_EXPERIMENT_FILE=experiments/exp_001.json\n"
+            "```"
+        )
+    else:
+        # Sumário
+        n_total    = len(df_exps)
+        n_pass     = int((df_exps["criterios_atingidos"] == True).sum())
+        n_fail     = int((df_exps["criterios_atingidos"] == False).sum())
+        n_pendente = int(df_exps["criterios_atingidos"].isna().sum())
+
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        ec1.metric("Total", n_total)
+        ec2.metric("✓ PASS", n_pass)
+        ec3.metric("✗ FAIL", n_fail)
+        ec4.metric("Pendente", n_pendente)
+
+        st.markdown("---")
+
+        # Lista de experimentos
+        for _, exp in df_exps.iterrows():
+            ok = exp.get("criterios_atingidos")
+            icon = "✓" if ok is True else ("✗" if ok is False else "⏳")
+            estado = exp.get("estado", "")
+            nome   = exp.get("nome", "") or str(exp.get("experimento_id", ""))[:8]
+
+            with st.expander(f"{icon} **{nome}**  |  {exp.get('baseline_nome', '?')}  |  {estado}"):
+                cx1, cx2 = st.columns(2)
+
+                with cx1:
+                    st.markdown(f"**Baseline**: {exp.get('baseline_nome')} ({exp.get('baseline_tipo')})")
+                    st.markdown(f"**Simulação**: `{exp.get('simulacao_id') or '(por iniciar)'}`")
+                    st.markdown(f"**Estado**: {estado}")
+                    if exp.get("criado_em"):
+                        st.markdown(f"**Criado**: {str(exp['criado_em'])[:16]}")
+                    if exp.get("concluido_em"):
+                        st.markdown(f"**Concluído**: {str(exp['concluido_em'])[:16]}")
+
+                    st.markdown("**Parâmetros alterados:**")
+                    try:
+                        params = exp.get("parametros_alterados")
+                        if isinstance(params, str):
+                            params = _json5.loads(params)
+                        if params:
+                            for k, v in params.items():
+                                if isinstance(v, dict):
+                                    st.markdown(f"  - `{k}`: {v.get('de')} → {v.get('para')}")
+                                else:
+                                    st.markdown(f"  - `{k}`: {v}")
+                    except Exception:
+                        pass
+
+                with cx2:
+                    st.markdown(f"**Justificação**: {exp.get('justificacao', '')}")
+                    st.markdown(f"**Esperado**: {exp.get('resultado_esperado', '')}")
+
+                    # Critérios e resultados
+                    try:
+                        criterios = exp.get("criterios_validacao")
+                        resultado = exp.get("resultado_real")
+                        if isinstance(criterios, str):
+                            criterios = _json5.loads(criterios or "[]")
+                        if isinstance(resultado, str):
+                            resultado = _json5.loads(resultado or "{}")
+                        if criterios:
+                            st.markdown("**Critérios:**")
+                            for c in criterios:
+                                m = c.get("metrica", "")
+                                real = (resultado or {}).get(m)
+                                real_str = f"{real:.4f}" if isinstance(real, float) else str(real)
+                                esperado = f"{c.get('op','')} {c.get('valor','')}"
+                                if real is not None:
+                                    op_fn = {">": lambda a,b: a>b, ">=": lambda a,b: a>=b,
+                                             "<": lambda a,b: a<b, "<=": lambda a,b: a<=b}.get(c.get("op",""), lambda a,b: False)
+                                    ok_c = op_fn(float(real), float(c.get("valor", 0)))
+                                    ci = "✓" if ok_c else "✗"
+                                    st.markdown(f"  {ci} `{m}`: **{real_str}** (esperado {esperado})")
+                                else:
+                                    st.markdown(f"  — `{m}`: (sem dados)  esperado {esperado}")
+                    except Exception:
+                        pass
 
 # ---------------------------------------------------------------------------
 # Auto-refresh

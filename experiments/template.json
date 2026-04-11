@@ -1,0 +1,46 @@
+{
+  "_comment": "Template para ficheiro de experimento. Copiar, preencher e commitar no repo.",
+  "_instrucoes": [
+    "1. Criar baseline: python3 -m scripts.create_baseline --simulacao_id <id> --nome <nome> --tipo experiment_control",
+    "2. Copiar este template, preencher todos os campos, guardar em experiments/exp_NNN_descricao.json",
+    "3. Commitar o ficheiro: git add experiments/exp_NNN.json && git commit",
+    "4. Criar registo: DATABASE_URL=... python3 -m scripts.create_experiment --file experiments/exp_NNN.json",
+    "5. Correr simulação: SNN_EXPERIMENT_FILE=experiments/exp_NNN.json DATABASE_URL=... uv run ...",
+    "6. Verificar resultados: DATABASE_URL=... python3 -m scripts.validate_experiment --experimento_id <uuid>"
+  ],
+
+  "baseline_id": "PREENCHER-UUID-DA-BASELINE",
+  "nome": "Descrição curta do experimento (ex: sweep_n_patches_2-6_world500)",
+
+  "_sweep_opcional": "Preencher se este experimento varia um parâmetro entre mundos",
+  "sweep_variable": "n_patches",
+  "sweep_values": [2, 3, 4, 6],
+  "n_replicas_per_value": 5,
+
+  "parametros_alterados": {
+    "_comment": "Listar TODOS os parâmetros que mudam vs baseline. Formato: {param: {de: X, para: Y}}",
+    "SNN_WORLD_SIZE": {"de": 200, "para": 500},
+    "SNN_VIDA_MAX":   {"de": 200, "para": 300}
+  },
+
+  "justificacao": "Explicar PORQUE se fazem estas alterações. Qual a hipótese que se testa?",
+
+  "resultado_esperado": "O que se espera observar. Ex: cv_fc1 > 1.0 sustentado após 1h; ≥3 tribos estáveis/mundo.",
+
+  "criterios_validacao": [
+    {
+      "_comment": "Métricas disponíveis: gen_max, gen_media, cv_fc1_media, n_vivos_media, elapsed_s",
+      "metrica": "cv_fc1_media",
+      "op": ">",
+      "valor": 1.0,
+      "janela_final_s": 300,
+      "_nota": "CV de diversidade genética médio nos últimos 300s"
+    },
+    {
+      "metrica": "gen_max",
+      "op": ">=",
+      "valor": 10,
+      "_nota": "Pelo menos 10 gerações atingidas"
+    }
+  ]
+}

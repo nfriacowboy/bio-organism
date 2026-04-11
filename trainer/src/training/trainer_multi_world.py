@@ -48,6 +48,7 @@ import torch
 from training.world_runner import WorldRunner, WorldConfig
 from training.inference_server import InferenceServer
 from training.db_writer import DBWriter
+from training.experiment_manager import ExperimentManager
 
 # ---------------------------------------------------------------------------
 # Env vars
@@ -131,7 +132,8 @@ def _gerar_configs(
 # ---------------------------------------------------------------------------
 
 def _db_regista_simulacao(
-    writer: DBWriter, simulacao_id: str, nota: str, n_mundos: int, configs: list[WorldConfig]
+    writer: DBWriter, simulacao_id: str, nota: str, n_mundos: int, configs: list[WorldConfig],
+    experimento_id: str | None = None, baseline_id: str | None = None,
 ) -> None:
     config_json = json.dumps({
         "nota":             nota,
@@ -146,10 +148,10 @@ def _db_regista_simulacao(
         "sweep_var":        "n_patches",
     })
     writer.execute_one("""
-        INSERT INTO simulacoes (simulacao_id, nota, n_mundos, config_json)
-        VALUES (%s,%s,%s,%s)
+        INSERT INTO simulacoes (simulacao_id, nota, n_mundos, config_json, experimento_id, baseline_id)
+        VALUES (%s,%s,%s,%s,%s,%s)
         ON CONFLICT (simulacao_id) DO NOTHING
-    """, (simulacao_id, nota, n_mundos, config_json))
+    """, (simulacao_id, nota, n_mundos, config_json, experimento_id, baseline_id))
 
     # n_food reused to store n_patches (patches sweep; food count controlled by PatchManager)
     writer.enqueue_many("""
@@ -260,11 +262,23 @@ def main() -> None:
     print(f"  Réplicas     : {dict(sorted(Counter(v for v in patch_counts.values()).items()))}")
     print()
 
+    # ExperimentManager — rastreabilidade científica
+    config_snapshot = {
+        "world_size": WORLD_SIZE, "n_org_per_world": N_ORG_PER_WORLD,
+        "vida_max": VIDA_MAX, "max_pop": MAX_POP, "patch_radius": PATCH_RADIUS,
+        "base_snn_path": BASE_SNN_PATH, "device": DEVICE_STR,
+        "n_patches_levels": sorted(set(c.n_patches for c in configs)),
+    }
+    exp_mgr = ExperimentManager(DATABASE_URL)
+    exp_ids = exp_mgr.on_start(simulacao_id, config_snapshot)
+
     # DB — único writer partilhado por todos os WorldRunners
     db_writer = DBWriter(DATABASE_URL)
     db_active = db_writer.start()
     if db_active:
-        _db_regista_simulacao(db_writer, simulacao_id, TREINO_NOTA, N_MUNDOS, configs)
+        _db_regista_simulacao(db_writer, simulacao_id, TREINO_NOTA, N_MUNDOS, configs,
+                              experimento_id=exp_ids.get("experimento_id"),
+                              baseline_id=exp_ids.get("baseline_id"))
     else:
         print("[multi] DB desactivada — a correr sem persistência")
 
@@ -355,6 +369,17 @@ def main() -> None:
 
     server.stop()
     db_writer.stop()
+
+    # ExperimentManager — validação de critérios pós-run
+    if all_stats:
+        metricas_finais = {
+            "gen_max":       max(s.get("gen_max", 0) for s in all_stats),
+            "gen_media":     float(np.mean([s.get("gen_max", 0) for s in all_stats])),
+            "cv_fc1_media":  float(np.mean([s.get("cv_fc1", 0) for s in all_stats])),
+            "n_vivos_media": float(np.mean([s.get("n_vivos", 0) for s in all_stats])),
+            "elapsed_s":     elapsed,
+        }
+        exp_mgr.on_complete(simulacao_id, metricas_finais)
 
 
 if __name__ == "__main__":

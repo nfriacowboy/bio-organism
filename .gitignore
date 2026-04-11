@@ -32,6 +32,9 @@ launch_v*.sh
 # Exports de treino (gerados automaticamente, podem ser grandes)
 exports/
 
+# Reviews (documentos de peer review, não fazer commit)
+reviews/
+
 # Misc
 .DS_Store
 *.log
